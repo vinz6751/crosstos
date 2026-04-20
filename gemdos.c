@@ -15,16 +15,22 @@
 
 #include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 #if defined(WIN32)
 #include <conio.h>
+#include <direct.h>
 #else
 
 #include <unistd.h>
 #include <termios.h>
 #include <assert.h>
 
+#endif
+
 #include "paths.h"
+
+#if !defined(WIN32)
 
 static int getch(void)
 {
@@ -644,6 +650,50 @@ uint32_t gemdos_dispatch(uint16_t opcode, uint32_t pd)
 		retval = 30 << 8;				/* GEMDOS 0.30 */
 		break;
 
+	/*
+	 * Dsetpath: set default directory. We map it to the host process cwd via
+	 * chdir() after resolving the TOS path with path_open (same rules as
+	 * Fopen). Limitation: not a full per-drive GEMDOS cwd; path_open for
+	 * "C:file" still roots at TOS_ROOT_PATH unless the path uses "C:.\...".
+	 */
+	case 0x003b:						/* Dsetpath() */
+		{
+			/* Stack: pathname is guest pointer to NUL-terminated TOS string. */
+			char *pathname = (char *)&rambase[READ_LONG(rambase, m68k_get_reg(NULL, M68K_REG_SP) + 2)];
+			char *resolved;
+			struct stat st;
+
+			if (trace_gemdos)
+				fprintf(stderr, "Dsetpath(\"%s\")\n", pathname);
+
+			resolved = path_open(pathname, true);
+			if (!resolved)
+			{
+				retval = GEMDOS_EFILNF;
+				break;
+			}
+			/* GEMDOS requires an existing directory; files are EFILNF. */
+			if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode))
+			{
+				path_close(resolved);
+				retval = GEMDOS_EFILNF;
+				break;
+			}
+#if defined(WIN32)
+			if (_chdir(resolved) != 0)
+#else
+			if (chdir(resolved) != 0)
+#endif
+			{
+				path_close(resolved);
+				retval = GEMDOS_E_EACCDN;
+				break;
+			}
+			path_close(resolved);
+			retval = GEMDOS_E_OK;
+		}
+		break;
+
 	case 0x3c:							/* Fcreate() */
 		{
 			uint32_t addr = READ_LONG(rambase, m68k_get_reg(NULL, M68K_REG_SP) + 2);
@@ -755,6 +805,7 @@ uint32_t gemdos_dispatch(uint16_t opcode, uint32_t pd)
 
 			(void) drive;
 
+			/* Stub: does not reflect Dsetpath/chdir or per-drive cwd. */
 			strcpy(buf, ".");
 
 			retval = GEMDOS_E_OK;
@@ -810,26 +861,74 @@ uint32_t gemdos_dispatch(uint16_t opcode, uint32_t pd)
 		}
 		break;
 
+	/*
+	 * Fsfirst: locate first matching name and fill the DTA at pd+OFF_P_DTA.
+	 * Minimal implementation: resolve one concrete path with path_open (no
+	 * wildcards / search state). Programs that only need "does this path
+	 * exist?" and DTA fields for that entry are satisfied. attr is ignored.
+	 * DTA: d_reserved[21], d_attrib @21, d_time @22, d_date @24, d_length @26,
+	 * d_fname[14] @30 (GEMDOS layout).
+	 */
 	case 0x004e:						/* int32_t Fsfirst ( const int8_t *filename, int16_t attr ) */
 		{
 			char *fname = (char *) &rambase[READ_LONG(rambase, m68k_get_reg(NULL, M68K_REG_SP) + 2)];
 			int16_t attr = READ_WORD(rambase, m68k_get_reg(NULL, M68K_REG_SP) + 6);
+			uint32_t dta = READ_LONG(rambase, pd + OFF_P_DTA);
+			struct stat st;
+			char *f;
 
-			char *f = path_open(fname, true);
+			(void)attr;
+
+			f = path_open(fname, true);
 
 			if (trace_gemdos || trace_unsupported)
 				fprintf(stderr, "Fsfirst(\"%s\", 0x%04x) (%s)\n", fname, attr, f);
 
-			path_close(f);
+			if (!f || stat(f, &st) != 0)
+			{
+				path_close(f);
+				retval = GEMDOS_EFILNF;
+				break;
+			}
 
-			retval = GEMDOS_EFILNF;
+			/* Fill DTA in guest RAM (see block comment above for layout). */
+			memset(&rambase[dta], 0, 21);
+			rambase[dta + 21] = (uint8_t)(S_ISDIR(st.st_mode) ? 0x10 : 0); /* folder bit */
+			WRITE_LONG(rambase, dta + 26, (uint32_t)st.st_size);
+			{
+				struct tm tm;
+				time_t m = st.st_mtime;
+
+				tm = *localtime(&m);
+				/* DOS time: h<<11 | m<<5 | s/2 */
+				WRITE_WORD(rambase, dta + 22,
+					(uint16_t)(((tm.tm_hour & 0x1f) << 11) | ((tm.tm_min & 0x3f) << 5) | ((tm.tm_sec / 2) & 0x1f)));
+				/* DOS date: (year-1980)<<9 | month<<5 | day */
+				WRITE_WORD(rambase, dta + 24,
+					(uint16_t)((((tm.tm_year + 1900 - 1980) & 0x7f) << 9) | (((tm.tm_mon + 1) & 0xf) << 5) | (tm.tm_mday & 0x1f)));
+			}
+			{
+				const char *bn = strrchr(f, '/');
+
+				bn = bn ? bn + 1 : f;
+				memset(&rambase[dta + 30], 0, 14);
+				strncpy((char *)&rambase[dta + 30], bn, 13); /* 8.3 + NUL, host basename */
+			}
+
+			path_close(f);
+			retval = GEMDOS_E_OK;
 		}
 		break;
 
 	case 0x004f:						/* int16_t Fsnext ( void ) */
 		if (trace_gemdos || trace_unsupported)
 			fprintf(stderr, "Fsnext()\n");
-		retval = GEMDOS_EFILNF;
+		/*
+		 * No DTA search cursor: Fsfirst only handles a single resolved path.
+		 * Return EFILNF so callers stop iterating (same code as “no more names”
+		 * in Atari Compendium / tos.hyp for this environment).
+		 */
+		retval = (uint32_t)GEMDOS_EFILNF;
 		break;
 
 	case 0x0056:						/* int32_t Frename ( const int8_t *oldname, const int8_t *newname ) */

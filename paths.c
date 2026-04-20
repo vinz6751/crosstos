@@ -1,3 +1,8 @@
+/*
+ * Map TOS-style paths (drive letters, backslashes, 8.3 names) to a host path
+ * string. Caller frees with path_open's result via path_close(). Resolution is
+ * case-insensitive on the host directory entries.
+ */
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -7,6 +12,7 @@
 #include <ctype.h>
 #include "paths.h"
 
+/* Advance *in past '/' or '\\'; optional output is the first non-separator. */
 static bool skip_slashes(char** in, char** out)
 {
     char*  str = *in;
@@ -28,6 +34,8 @@ static bool skip_slashes(char** in, char** out)
     return found;
 }
 
+/* If *in starts with "C:".."Z:", skip it and any following slashes. *in becomes
+ * the path relative to that drive (e.g. ".\FOO.S" or "AUTO\PRG"). */
 static bool skip_rootdrive(char** in)
 {
     char*  str = *in;
@@ -53,6 +61,7 @@ static bool skip_rootdrive(char** in)
     return found;
 }
 
+/* Length of one path component: up to (but not including) next '/' or '\\'. */
 static int count_chars(char** in, char** out)
 {
     char* str    = *in;
@@ -73,6 +82,8 @@ static int count_chars(char** in, char** out)
     return count;
 }
 
+/* Look for a directory entry matching item[0..count) under path (case fold).
+ * On success, append "/" and the real directory name to path (length grows). */
 static bool path_find_item(char* path, char* item, int count)
 {
     bool match = false;
@@ -123,7 +134,7 @@ static bool path_find_item(char* path, char* item, int count)
     return match;
 }
 
-void path_close(char* path)
+void path_close(char* path) /* free() wrapper for path_open result */
 {
     if(path)
     {
@@ -131,6 +142,11 @@ void path_close(char* path)
     }
 }
 
+/*
+ * exist: if true, every path component must exist in the host tree; otherwise
+ * the final missing component may be appended (for creating a new file name).
+ * Returns malloc'd host path or NULL on failure.
+ */
 char* path_open(char* fname, bool exist)
 {
     char* search_path = malloc(4000);
@@ -138,30 +154,39 @@ char* path_open(char* fname, bool exist)
 
     if(search_path)
     {
-        /*
-         * Check for leading slashes to determine
-         * starting point (relative cwd or absolute path)
-         */
-
-        //printf("search %s, %d\n", fname, exist);
-
         if(skip_rootdrive(&fname))
         {
             /*
-             * Slashes found.
-             *  - this is an absolute path
+             * After "C:" the old logic always rooted at TOS_ROOT_PATH or "/" and
+             * walked path components from there. Programs can pass paths like
+             * "C:.\FOO.S" (current directory on the drive). The first segment is
+             * then ".", which under "/" becomes a broken path (e.g. "//.") and
+             * path_open returns NULL — Fsfirst/Fopen then see EFILNF even when
+             * FOO.S exists in the host cwd. Treat ".\..." / "./..." after the
+             * drive as host-relative: start from "." so case-insensitive lookup
+             * finds the file next to the emulated binary.
              */
-
-            if ((root_path = getenv("TOS_ROOT_PATH")) != NULL)
-                strcpy(search_path, root_path);
-            else
-                strcpy(search_path, "/");
+            if (fname[0] == '.' && (fname[1] == '\\' || fname[1] == '/'))
+            {
+                fname += 2;
+                while (*fname == '\\' || *fname == '/')
+                    fname++;
+                strcpy(search_path, ".");
+            } else
+            {
+                if ((root_path = getenv("TOS_ROOT_PATH")) != NULL)
+                    strcpy(search_path, root_path);
+                else
+                    strcpy(search_path, "/");
+            }
         }
         else
         {
+            /* No "C:" — path is relative to host cwd. */
             strcpy(search_path, ".");
         }
 
+        /* Walk fname one component at a time, extending search_path. */
         char* fnext = fname;
 
         do
@@ -186,8 +211,8 @@ char* path_open(char* fname, bool exist)
             }
             else
             {
-            //    printf("fend %s fnext %s exist %d\n", fend, fnext, exist);
- 
+                /* Component not found: fail if more path remains or caller
+                 * requires full resolution; else append rest (new file path). */
                 if(*fend || exist)
                 {
                     free(search_path);
